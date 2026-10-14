@@ -171,7 +171,10 @@ export function NetScope() {
     tick();
     return () => { stop = true; };
   }, [state, iface, room, ingest]);
-  const remoteCmd = `curl -fsSL https://raw.githubusercontent.com/mummuzumill-ops/wiresharp-terminal-script/main/install.sh | sudo bash -s -- --room ${room}`;
+  const base = "https://raw.githubusercontent.com/mummuzumill-ops/wiresharp-terminal-script/main";
+  const remoteCmd = navigator.userAgent.includes("Windows")
+    ? `irm ${base}/install.ps1 | iex  # then pass -Room ${room} (run PowerShell as Administrator)`
+    : `curl -fsSL ${base}/install.sh | sudo bash -s -- --room ${room}`;
 
   const clear = () => { pkts.current = []; lan.current = new Map(); analyzer.current = new Analyzer(); nextId.current = 1; setSelId(null); setDevice(null); setVer((v) => v + 1); };
 
@@ -295,11 +298,13 @@ export function NetScope() {
               </li>
               <li>
                 <p className="font-medium">2. Run it in a terminal (admin rights needed to see traffic)</p>
-                <pre className="mt-1 overflow-x-auto rounded bg-background p-2 font-mono text-xs">{`git clone https://github.com/mummuzumill-ops/wiresharp-terminal-script.git
-cd wiresharp-terminal-script
-sudo python3 capture_agent.py --room ${room}`}</pre>
-                <p className="mt-1 text-xs text-muted-foreground">Linux / macOS · Windows (Run as Administrator) · add <span className="font-mono">--test</span> for a no-root demo</p>
-                <p className="mt-1 text-xs text-muted-foreground">Linux needs no installs. macOS / Windows: <span className="font-mono">pip install scapy</span> (Windows also needs Npcap).</p>
+                <pre className="mt-1 overflow-x-auto rounded bg-background p-2 font-mono text-xs">{`# Linux / macOS
+curl -fsSL ${base}/install.sh | sudo bash -s -- --room ${room}
+
+# Windows (PowerShell, Run as Administrator)
+irm ${base}/install.ps1 | iex`}</pre>
+                <p className="mt-1 text-xs text-muted-foreground">Linux / macOS · Windows uses PowerShell as Administrator (no <span className="font-mono">sudo</span>) · add <span className="font-mono">--test</span> for a no-root demo</p>
+                <p className="mt-1 text-xs text-muted-foreground">Linux needs no installs. macOS / Windows: Scapy. Windows also needs the Npcap driver — <span className="font-mono">https://npcap.com/#download</span>.</p>
               </li>
               <li>
                 <p className="font-medium">3. Connect from NetScope</p>
