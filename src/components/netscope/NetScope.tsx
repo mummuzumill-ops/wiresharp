@@ -153,6 +153,7 @@ export function NetScope() {
       if (stop) return;
       try {
         const res = await fetch(`/api/public/relay?room=${encodeURIComponent(room)}&after=${after}`, { cache: "no-store" });
+        if (!res.ok) throw new Error(`relay HTTP ${res.status}`);
         const j = await res.json();
         const items = j.items ?? [];
         const frames: { data: Uint8Array; ts: number }[] = [];
@@ -164,8 +165,8 @@ export function NetScope() {
         }
         if (frames.length) ingest(frames); else if (items.length) setVer((v) => v + 1);
         idle = items.length ? 0 : idle + 1;
-        setRelayStatus(items.length ? "receiving" : idle > 10 ? "connected — no data yet" : "listening");
-      } catch { setRelayStatus("relay error, retrying"); }
+        setRelayStatus(items.length ? `receiving (${items.length})` : idle > 10 ? `connected — no data yet (${after} seen)` : "listening");
+      } catch (e) { setRelayStatus(`relay error: ${(e as Error).message}`); }
       if (!stop) setTimeout(tick, 700);
     };
     tick();
