@@ -1,0 +1,609 @@
+// @ts-nocheck -- byte-level parsing code; strict index checks would add noise without safety gains
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, FileUp, Pause, Play, Plug, Radio, Square, Trash2, X, Search, Smartphone, Laptop, Router, Cpu, Tv, Server, Globe, ChevronLeft, Terminal } from "lucide-react";
+import { Analyzer, decodeFrame, type Packet, type Proto, type Field } from "@/lib/netscope/decode";
+import { annotate, CAT_CLS } from "@/lib/netscope/apps";
+import { parseCapture } from "@/lib/netscope/pcap";
+import { scenario, SIM_DEVICES } from "@/lib/netscope/simulator";
+import { explainPacket } from "@/lib/netscope/explain";
+import agentSource from "../../../public/capture_agent.py?raw";
+
+const agentScript = () => agentSource.replace("__NETSCOPE_SERVER__", window.location.origin);
+function downloadAgent() {
+  const url = URL.createObjectURL(new Blob([agentScript()], { type: "text/x-python;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "capture_agent.py";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+const newRoom = () => {
+  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const r = crypto.getRandomValues(new Uint8Array(10));
+  const s = Array.from(r, (b) => c[b % c.length]).join("");
+  return `NET-${s.slice(0, 5)}-${s.slice(5)}`;
+};
+
+const MAX = 20000;
+const PROTO_CLS: Record<Proto, string> = {
+  DNS: "text-p-dns", TLS: "text-p-tls", HTTP: "text-p-http", TCP: "text-p-tcp", UDP: "text-p-udp",
+  ICMP: "text-p-icmp", ARP: "text-p-arp", IPv6: "text-muted-foreground", OTHER: "text-muted-foreground",
+};
+const OUI: Record<string, string> = { "3c:22:fb": "Apple", "a4:83:e7": "Apple", "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi", "00:1a:11": "Google", "f4:f2:6d": "TP-Link", "50:02:91": "Espressif", "24:0a:c4": "Espressif", "d8:bb:c1": "Micro-Star", "00:50:56": "VMware", "08:00:27": "VirtualBox", "00:0c:29": "VMware" };
+const isPrivate = (ip: string) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fe80|fd)/.test(ip);
+const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`);
+const IFACES = ["sim0 — Live simulator", "ws0 — Live capture (agent)", "relay — Remote session (internet)", "file — PCAP import"];
+
+interface Device { ip: string; mac?: string; host?: string; vendor?: string; pkts: number; bytesIn: number; bytesOut: number; protos: Set<Proto>; last: number; peers: Set<string>; discovered?: boolean; gateway?: boolean; self?: boolean }
+
+function deviceIcon(d: Device) {
+  const v = `${d.vendor} ${d.host}`.toLowerCase();
+  if (v.includes("gateway") || v.includes("tp-link")) return Router;
+  if (v.includes("iphone") || v.includes("android")) return Smartphone;
+  if (v.includes("cast") || v.includes("tv")) return Tv;
+  if (v.includes("esp") || v.includes("pi")) return Cpu;
+  if (v.includes("mac") || v.includes("desktop") || v.includes("win")) return Laptop;
+  return Server;
+}
+
+function matches(p: Packet, q: string, latest: number) {
+  for (const tok of q.trim().toLowerCase().split(/\s+/).filter(Boolean)) {
+    const [k, v] = tok.includes(":") && !/^[\da-f:]+$/.test(tok) ? [tok.slice(0, tok.indexOf(":")), tok.slice(tok.indexOf(":") + 1)] : ["", tok];
+    if (k === "ip") { if (p.src !== v && p.dst !== v) return false; }
+    else if (k === "port") { if (String(p.srcPort) !== v && String(p.dstPort) !== v) return false; }
+    else if (k === "proto") { if (p.proto.toLowerCase() !== v && !(v === "tcp" && p.tcpFlags !== undefined) && !(v === "udp" && p.proto === "DNS")) return false; }
+    else if (k === "last") { const s = parseFloat(v) * (v.endsWith("m") ? 60 : 1); if (latest - p.ts > s * 1000) return false; }
+    else if (k === "retrans") { if (!p.retrans) return false; }
+    else if (!`${p.src} ${p.dst} ${p.info} ${p.proto} ${p.srcPort} ${p.dstPort}`.toLowerCase().includes(v)) return false;
+  }
+  return true;
+}
+
+export function NetScope() {
+  const pkts = useRef<Packet[]>([]);
+  const analyzer = useRef(new Analyzer());
+  const nextId = useRef(1);
+  const hosts = useRef(new Map<string, string>());
+  const [ver, setVer] = useState(0);
+  const [state, setState] = useState<"stopped" | "running" | "paused">("stopped");
+  const [iface, setIface] = useState(IFACES[0]);
+  const [filter, setFilter] = useState("");
+  const [device, setDevice] = useState<string | null>(null);
+  const [selId, setSelId] = useState<number | null>(null);
+  const [hl, setHl] = useState<[number, number] | null>(null);
+  const [tab, setTab] = useState<"activity" | "packets" | "flows" | "dns" | "tls" | "http">("activity");
+  const [appSel, setAppSel] = useState<string | null>(null);
+  const [wsUrl, setWsUrl] = useState("ws://localhost:9000/capture");
+  const [wsStatus, setWsStatus] = useState("disconnected");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [agent, setAgent] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const lan = useRef<Map<string, { ip: string; mac?: string; name?: string; gateway?: boolean; self?: boolean }>>(new Map());
+  const [copied, setCopied] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const ingest = useCallback((frames: { data: Uint8Array; ts: number; linktype?: number }[]) => {
+    for (const f of frames) {
+      const p = analyzer.current.apply(decodeFrame(f.data, f.ts, nextId.current++, f.linktype ?? 1));
+      if (p.dns?.response) p.dns.answers.forEach((a) => { const ip = a.split(" ")[1]; if (ip) hosts.current.set(ip, p.dns!.name); });
+      if (p.tls?.sni) hosts.current.set(p.dst, p.tls.sni);
+      annotate(p, (ip) => (isPrivate(ip) ? undefined : hosts.current.get(ip)));
+      pkts.current.push(p);
+    }
+    if (pkts.current.length > MAX) pkts.current.splice(0, pkts.current.length - MAX);
+    setVer((v) => v + 1);
+  }, []);
+
+  // Simulator
+  useEffect(() => {
+    if (state !== "running" || !iface.startsWith("sim")) return;
+    const gen = scenario();
+    SIM_DEVICES.forEach((d) => hosts.current.set(d.ip, d.host));
+    let t = 0;
+    const iv = setInterval(() => {
+      const batch: { data: Uint8Array; ts: number }[] = [];
+      for (let i = 0; i < 1 + Math.floor(Math.random() * 3); i++)
+        for (const fr of gen.next().value!) batch.push({ data: fr, ts: Date.now() + (t += 0.2) % 1 });
+      ingest(batch);
+    }, 250);
+    return () => clearInterval(iv);
+  }, [state, iface, ingest]);
+
+  // WebSocket ingestion: messages are JSON {hex|base64, ts?, linktype?} or an array of them
+  useEffect(() => {
+    if (state !== "running" || !iface.startsWith("ws")) return;
+    let ws: WebSocket;
+    try { ws = new WebSocket(wsUrl); } catch { setWsStatus("invalid URL"); return; }
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+    setWsStatus("connecting…");
+    ws.onopen = () => setWsStatus("connected");
+    ws.onerror = () => setWsStatus("error");
+    ws.onclose = () => setWsStatus("disconnected");
+    ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) return ingest([{ data: new Uint8Array(e.data), ts: Date.now() }]);
+      try {
+        const j = JSON.parse(e.data);
+        if (j && j.type === "devices") {
+          for (const d of j.devices) { lan.current.set(d.ip, d); if (d.name) hosts.current.set(d.ip, d.name); }
+          return setVer((v) => v + 1);
+        }
+        const arr = Array.isArray(j) ? j : [j];
+        ingest(arr.map((m: { hex?: string; base64?: string; ts?: number; linktype?: number }) => ({
+          data: m.hex ? new Uint8Array(m.hex.match(/../g)!.map((h) => parseInt(h, 16))) : Uint8Array.from(atob(m.base64 ?? ""), (c) => c.charCodeAt(0)),
+          ts: m.ts ?? Date.now(), linktype: m.linktype,
+        })));
+      } catch { /* ignore malformed */ }
+    };
+    return () => ws.close();
+  }, [state, iface, wsUrl, ingest]);
+
+  // Remote session: poll the cloud relay for frames pushed by an agent anywhere on the internet
+  const [room, setRoom] = useState("");
+  const [relayStatus, setRelayStatus] = useState("idle");
+  useEffect(() => {
+    let r = localStorage.getItem("netscope-room");
+    if (!r) { r = newRoom(); localStorage.setItem("netscope-room", r); }
+    setRoom(r);
+  }, []);
+  useEffect(() => {
+    if (state !== "running" || !iface.startsWith("relay") || !room) return;
+    let after = 0, stop = false, idle = 0;
+    setRelayStatus("waiting for agent…");
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const res = await fetch(`/api/public/relay?room=${encodeURIComponent(room)}&after=${after}`, { cache: "no-store" });
+        const j = await res.json();
+        const items = j.items ?? [];
+        const frames: { data: Uint8Array; ts: number }[] = [];
+        for (const it of items) {
+          after = Math.max(after, it.id);
+          if (it.kind === "devices") {
+            try { const d = JSON.parse(it.payload); for (const x of d.devices ?? []) { lan.current.set(x.ip, x); if (x.name) hosts.current.set(x.ip, x.name); } } catch { /* skip */ }
+          } else frames.push({ data: Uint8Array.from(atob(it.payload), (c) => c.charCodeAt(0)), ts: it.ts ?? Date.now() });
+        }
+        if (frames.length) ingest(frames); else if (items.length) setVer((v) => v + 1);
+        idle = items.length ? 0 : idle + 1;
+        setRelayStatus(items.length ? "receiving" : idle > 10 ? "connected — no data yet" : "listening");
+      } catch { setRelayStatus("relay error, retrying"); }
+      if (!stop) setTimeout(tick, 700);
+    };
+    tick();
+    return () => { stop = true; };
+  }, [state, iface, room, ingest]);
+  const remoteCmd = `curl -fsSL https://raw.githubusercontent.com/mummuzumill-ops/wiresharp-terminal-script/main/install.sh | sudo bash -s -- --room ${room}`;
+
+  const clear = () => { pkts.current = []; lan.current = new Map(); analyzer.current = new Analyzer(); nextId.current = 1; setSelId(null); setDevice(null); setVer((v) => v + 1); };
+
+  const onFile = async (f: File) => {
+    try {
+      const frames = parseCapture(await f.arrayBuffer());
+      setState("stopped");
+      setIface(IFACES[2]);
+      clear();
+      ingest(frames.map((fr) => ({ ...fr, data: fr.data.slice() })));
+      setMsg(`Imported ${frames.length.toLocaleString()} packets from ${f.name}`);
+    } catch (e) { setMsg((e as Error).message); }
+  };
+
+  const all = pkts.current;
+  const latest = all.length ? all[all.length - 1].ts : Date.now();
+
+  const devices = useMemo(() => {
+    const m = new Map<string, Device>();
+    const get = (ip: string) => { let d = m.get(ip); if (!d) m.set(ip, (d = { ip, pkts: 0, bytesIn: 0, bytesOut: 0, protos: new Set(), last: 0, peers: new Set() })); return d; };
+    for (const p of all) {
+      if (p.src === "?") continue;
+      for (const [ip, out] of [[p.src, true], [p.dst, false]] as const) {
+        if (!isPrivate(ip) || ip.endsWith(".255")) continue;
+        const d = get(ip);
+        d.pkts++;
+        if (out) { d.bytesOut += p.length; d.mac ??= p.srcMac; } else { d.bytesIn += p.length; if (p.proto !== "ARP") d.mac ??= p.dstMac; }
+        d.protos.add(p.proto);
+        d.last = Math.max(d.last, p.ts);
+        d.peers.add(out ? p.dst : p.src);
+      }
+    }
+    for (const l of lan.current.values()) { const d = get(l.ip); if (l.mac) d.mac ??= l.mac; d.discovered = true; d.gateway = l.gateway; d.self = l.self; }
+    for (const d of m.values()) {
+      d.host = hosts.current.get(d.ip);
+      d.vendor = d.mac ? OUI[d.mac.slice(0, 8)] ?? "Unknown vendor" : undefined;
+    }
+    return [...m.values()].sort((a, b) => b.bytesIn + b.bytesOut - (a.bytesIn + a.bytesOut));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ver]);
+
+  const view = useMemo(() => all.filter((p) => (!device || p.src === device || p.dst === device) && matches(p, filter, latest)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ver, device, filter]);
+
+  const sel = useMemo(() => all.find((p) => p.id === selId) ?? null, [selId, ver, all]);
+  const dev = devices.find((d) => d.ip === device);
+
+  const stats = useMemo(() => {
+    const by: Partial<Record<Proto, number>> = {};
+    let bytes = 0, retrans = 0;
+    view.forEach((p) => { by[p.proto] = (by[p.proto] ?? 0) + 1; bytes += p.length; if (p.retrans) retrans++; });
+    return { by, bytes, retrans };
+  }, [view]);
+
+  return (
+    <div className="flex h-dvh flex-col bg-background text-foreground">
+      {/* Toolbar */}
+      <header className="flex flex-wrap items-center gap-2 border-b border-border bg-sidebar px-3 py-2">
+        <div className="mr-2 flex items-center gap-2">
+          <img src="/icon-192.png" alt="" width={28} height={28} className="rounded" />
+          <span className="font-semibold tracking-tight">NetScope</span>
+        </div>
+        <select value={iface} onChange={(e) => { setState("stopped"); setIface(e.target.value); }} className="h-8 rounded border border-input bg-background px-2 font-mono text-xs" aria-label="Interface">
+          {IFACES.map((i) => <option key={i}>{i}</option>)}
+        </select>
+        <div className="flex items-center gap-1">
+          <ToolBtn label={state === "running" ? "Pause" : "Start"} onClick={() => setState(state === "running" ? "paused" : "running")} disabled={iface.startsWith("file")} primary>
+            {state === "running" ? <Pause className="size-4" /> : <Play className="size-4" />}
+          </ToolBtn>
+          <ToolBtn label="Stop" onClick={() => setState("stopped")} disabled={state === "stopped"}><Square className="size-4" /></ToolBtn>
+          <ToolBtn label="Clear" onClick={clear}><Trash2 className="size-4" /></ToolBtn>
+          <ToolBtn label="Open PCAP" onClick={() => fileRef.current?.click()}><FileUp className="size-4" /></ToolBtn>
+          <ToolBtn label="Get agent" onClick={() => setAgent(true)}><Terminal className="size-4" /></ToolBtn>
+          <input ref={fileRef} type="file" accept=".pcap,.pcapng,.cap" hidden onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
+        </div>
+        {iface.startsWith("ws") && (
+          <div className="flex items-center gap-1">
+            <Plug className="size-4 text-muted-foreground" />
+            <input value={wsUrl} onChange={(e) => setWsUrl(e.target.value)} className="h-8 w-56 rounded border border-input bg-background px-2 font-mono text-xs" aria-label="WebSocket URL" />
+            <span className="font-mono text-xs text-muted-foreground">{wsStatus}</span>
+          </div>
+        )}
+        {iface.startsWith("relay") && (
+          <div className="flex items-center gap-2 font-mono text-xs">
+            <Globe className="size-4 text-muted-foreground" />
+            <span className="rounded bg-muted px-2 py-1 text-primary">{room}</span>
+            <button className="rounded border border-border px-2 py-1" onClick={() => navigator.clipboard.writeText(remoteCmd)}>Copy command</button>
+            <button className="rounded border border-border px-2 py-1" onClick={() => { const r = newRoom(); localStorage.setItem("netscope-room", r); setRoom(r); }}>New code</button>
+            <span className="text-muted-foreground">{relayStatus}</span>
+          </div>
+        )}
+        <div className="ml-auto flex items-center gap-2 font-mono text-xs">
+          <span className={`inline-flex items-center gap-1 rounded px-2 py-1 ${state === "running" ? "bg-accent text-primary" : "bg-muted text-muted-foreground"}`}>
+            <Radio className={`size-3 ${state === "running" ? "animate-pulse" : ""}`} /> {state.toUpperCase()}
+          </span>
+          <span className="text-muted-foreground">{all.length.toLocaleString()} pkts</span>
+        </div>
+      </header>
+
+      {/* Filter */}
+      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
+        <Search className="size-4 text-muted-foreground" />
+        <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter: ip:192.168.1.14  port:443  proto:dns  last:30s  retrans:  or free text…" className="h-8 flex-1 rounded border border-input bg-background px-2 font-mono text-xs outline-none focus:border-ring" />
+        {filter && <button onClick={() => setFilter("")} aria-label="Clear filter"><X className="size-4 text-muted-foreground" /></button>}
+      </div>
+      {msg && <div className="flex items-center justify-between bg-accent px-3 py-1 text-xs">{msg}<button onClick={() => setMsg(null)} aria-label="Dismiss"><X className="size-3" /></button></div>}
+
+      {agent && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => setAgent(false)}>
+          <div className="max-h-[85dvh] w-full max-w-lg overflow-auto rounded-lg border border-border bg-card p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2">
+              <Terminal className="size-5 text-primary" />
+              <h2 className="text-base font-semibold">Live capture agent</h2>
+              <button className="ml-auto text-muted-foreground hover:text-foreground" onClick={() => setAgent(false)} aria-label="Close"><X className="size-4" /></button>
+            </div>
+            <ol className="mt-3 space-y-3 text-sm">
+              <li>
+                <p className="font-medium">1. Download the script</p>
+                <div className="mt-1 flex flex-wrap gap-2"><button onClick={downloadAgent} className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"><Terminal className="size-3" /> Download capture_agent.py</button><button onClick={async () => { await navigator.clipboard.writeText(agentScript()); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="rounded border border-border px-3 py-1.5 text-xs">{copied ? "Copied!" : "Copy script"}</button></div>
+              </li>
+              <li>
+                <p className="font-medium">2. Run it in a terminal (admin rights needed to see traffic)</p>
+                <pre className="mt-1 overflow-x-auto rounded bg-background p-2 font-mono text-xs">{`git clone https://github.com/mummuzumill-ops/wiresharp-terminal-script.git
+cd wiresharp-terminal-script
+sudo python3 capture_agent.py --room ${room}`}</pre>
+                <p className="mt-1 text-xs text-muted-foreground">Linux / macOS · Windows (Run as Administrator) · add <span className="font-mono">--test</span> for a no-root demo</p>
+                <p className="mt-1 text-xs text-muted-foreground">Linux needs no installs. macOS / Windows: <span className="font-mono">pip install scapy</span> (Windows also needs Npcap).</p>
+              </li>
+              <li>
+                <p className="font-medium">3. Connect from NetScope</p>
+                <p className="mt-1 text-xs text-muted-foreground">Pick <span className="font-mono">ws0 — Live capture (agent)</span> above and press Start. On this PC the app connects to <span className="font-mono">ws://localhost:9000</span>; from a phone on the same Wi-Fi use the LAN address the script prints (e.g. <span className="font-mono">ws://192.168.1.5:9000</span>).</p>
+              </li>
+              <li className="rounded border border-primary/40 bg-background p-3">
+                <p className="font-medium">Remote session — friend in another city</p>
+                <p className="mt-1 text-xs text-muted-foreground">Send them the downloaded script. They run this one command; their packets and Wi-Fi devices stream here over the internet (no router setup). Pick <span className="font-mono">relay — Remote session</span> above and press Start.</p>
+                <pre className="mt-1 overflow-x-auto rounded bg-muted p-2 font-mono text-xs">{remoteCmd}</pre>
+                <p className="mt-1 text-xs text-muted-foreground">Keep the code private — anyone with it can watch the stream. Works once the app is published.</p>
+              </li>
+            </ol>
+            <div className="mt-4 rounded border border-border bg-background p-3">
+              <p className="text-sm font-medium">See every device's traffic, not just this one</p>
+              <p className="mt-1 text-xs text-muted-foreground">The agent now captures in promiscuous mode and keeps probing every device it finds on your Wi-Fi, so all phones, TVs and the router show up as live cards. Wi-Fi encrypts each device's private data separately, so to see their <em>full</em> traffic one of these is needed:</p>
+              <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+                <li><span className="font-medium text-foreground">Easiest:</span> turn on your laptop's Mobile Hotspot and connect phones/TV to it — your laptop becomes the router, so you see 100% of their traffic.</li>
+                <li><span className="font-medium text-foreground">Router mirroring:</span> enable port mirroring / SPAN on your router toward this laptop.</li>
+                <li><span className="font-medium text-foreground">On the gateway:</span> run this same script on a Linux router, OpenWrt box or Raspberry Pi that all traffic passes through.</li>
+              </ul>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">Tip: HTTPS hides page paths and contents — you still see every site your devices contact, plus ports, protocols and sizes.</p>
+          </div>
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        {/* Devices */}
+        <aside className="shrink-0 border-b border-border bg-sidebar lg:w-72 lg:border-b-0 lg:border-r">
+          <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-muted-foreground">
+            <span>Devices ({devices.length})</span>
+            {device && <button className="normal-case text-primary" onClick={() => setDevice(null)}>Show all</button>}
+          </div>
+          <div className="flex gap-2 overflow-x-auto px-2 pb-2 lg:max-h-[calc(100dvh-140px)] lg:flex-col lg:overflow-y-auto lg:overflow-x-hidden">
+            {devices.length === 0 && <p className="px-2 py-4 text-sm text-muted-foreground">Press Start to run the live simulator, or open a PCAP file.</p>}
+            {devices.map((d) => {
+              const Icon = deviceIcon(d);
+              const active = d.discovered || latest - d.last < 10000;
+              return (
+                <button key={d.ip} onClick={() => setDevice(device === d.ip ? null : d.ip)}
+                  className={`w-60 shrink-0 rounded-md border p-2.5 text-left transition-colors lg:w-full ${device === d.ip ? "border-primary bg-accent" : "border-border bg-card hover:border-ring/50"}`}>
+                  <div className="flex items-center gap-2">
+                    <Icon className="size-4 text-primary" />
+                    <span className="truncate text-sm font-medium">{d.host ?? d.ip}</span>
+                    {d.gateway && <span className="rounded bg-muted px-1 text-[10px] text-muted-foreground">router</span>}
+                    {d.self && <span className="rounded bg-muted px-1 text-[10px] text-muted-foreground">you</span>}
+                    <span className={`ml-auto size-2 rounded-full ${active ? "bg-primary" : "bg-muted-foreground/40"}`} title={active ? "Active" : "Idle"} />
+                  </div>
+                  <div className="mt-1 font-mono text-[11px] text-muted-foreground">{d.ip}{d.mac && ` · ${d.mac}`}</div>
+                  <div className="text-[11px] text-muted-foreground">{d.vendor}</div>
+                  <div className="mt-1.5 flex items-center justify-between font-mono text-[11px]">
+                    <span>↑{fmtBytes(d.bytesOut)} ↓{fmtBytes(d.bytesIn)}</span>
+                    <span className="text-muted-foreground">{d.pkts} pkts</span>
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {[...d.protos].map((p) => <span key={p} className={`rounded bg-muted px-1 font-mono text-[10px] ${PROTO_CLS[p]}`}>{p}</span>)}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+
+        {/* Main */}
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-3 py-2 text-xs">
+            {dev ? <span className="font-medium text-primary">Isolated: {dev.host ?? dev.ip} · {dev.peers.size} peers</span> : <span className="text-muted-foreground">All traffic</span>}
+            <span className="font-mono">{view.length.toLocaleString()} pkts · {fmtBytes(stats.bytes)}</span>
+            {(Object.keys(stats.by) as Proto[]).map((p) => <span key={p} className={`font-mono ${PROTO_CLS[p]}`}>{p} {stats.by[p]}</span>)}
+            {stats.retrans > 0 && <span className="font-mono text-warning">retrans {stats.retrans}</span>}
+          </div>
+          <nav className="flex gap-1 overflow-x-auto border-b border-border px-2">
+            {(["activity", "packets", "flows", "dns", "tls", "http"] as const).map((t) => (
+              <button key={t} onClick={() => setTab(t)} className={`border-b-2 px-3 py-2 text-xs font-medium uppercase tracking-wide ${tab === t ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}>{t === "activity" ? "Apps & activity" : t}</button>
+            ))}
+          </nav>
+          <div className="min-h-0 flex-1 overflow-auto">
+            {tab === "activity" && <AppsView rows={view} app={appSel} setApp={setAppSel} hostOf={(ip) => hosts.current.get(ip) ?? ip} t0={all[0]?.ts ?? 0} onSel={(id) => { setSelId(id); setTab("packets"); }} />}
+            {tab === "packets" && <PacketTable rows={view} selId={selId} onSel={(id) => { setSelId(id); setHl(null); }} t0={all[0]?.ts ?? 0} />}
+            {tab === "flows" && <Flows rows={view} />}
+            {tab === "dns" && <Insight rows={view.filter((p) => p.dns)} cols={["App", "Name", "Type", "Kind", "Answers", "Latency"]} cell={(p) => [p.app ?? "", p.dns!.name, p.dns!.qtype, p.dns!.response ? "response" : "query", p.dns!.answers.join(", "), p.dns!.latencyMs != null ? `${p.dns!.latencyMs.toFixed(1)} ms` : ""]} onSel={(id) => { setSelId(id); setTab("packets"); }} />}
+            {tab === "tls" && <Insight rows={view.filter((p) => p.tls && p.tls.type !== "Application Data")} cols={["App", "Message", "SNI / CN", "Version", "Cipher", "Server"]} cell={(p) => [p.app ?? "", p.tls!.type, p.tls!.sni ?? p.tls!.cert ?? hosts.current.get(p.src) ?? "", p.tls!.version ?? "", p.tls!.cipher ?? (p.tls!.ciphers ? `${p.tls!.ciphers.length} offered` : ""), p.tls!.type === "ClientHello" ? p.dst : p.src]} onSel={(id) => { setSelId(id); setTab("packets"); }} />}
+            {tab === "http" && <Insight rows={view.filter((p) => p.http)} cols={["App", "Method / Status", "Full URL", "Content-Type", "Version"]} cell={(p) => [p.app ?? "", p.http!.method ?? String(p.http!.status ?? ""), p.url ?? p.http!.host ?? p.src, p.http!.contentType ?? "", p.http!.version]} onSel={(id) => { setSelId(id); setTab("packets"); }} />}
+          </div>
+          {sel && tab === "packets" && (
+            <div className="grid max-h-[45%] min-h-48 shrink-0 grid-cols-1 border-t border-border md:grid-cols-2">
+              <ProtoTree p={sel} onField={(f) => setHl(f.r ?? null)} hl={hl} />
+              <HexView bytes={sel.bytes} hl={hl} />
+              <Explain p={sel} host={(ip) => hosts.current.get(ip)} />
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function ToolBtn({ children, label, onClick, disabled, primary }: { children: React.ReactNode; label: string; onClick: () => void; disabled?: boolean; primary?: boolean }) {
+  return (
+    <button title={label} aria-label={label} onClick={onClick} disabled={disabled}
+      className={`inline-flex h-8 items-center gap-1 rounded px-2 text-xs disabled:opacity-40 ${primary ? "bg-primary text-primary-foreground hover:bg-primary/90" : "border border-border hover:bg-muted"}`}>
+      {children}<span className="hidden sm:inline">{label}</span>
+    </button>
+  );
+}
+
+function PacketTable({ rows, selId, onSel, t0 }: { rows: Packet[]; selId: number | null; onSel: (id: number) => void; t0: number }) {
+  const shown = rows.slice(-600);
+  const ref = useRef<HTMLDivElement>(null);
+  return (
+    <div ref={ref}>
+      <table className="w-full font-mono text-[11px]">
+        <thead className="sticky top-0 bg-card text-left text-muted-foreground">
+          <tr>{["No.", "Time", "Source", "Destination", "Proto", "App", "Len", "Info"].map((h) => <th key={h} className="whitespace-nowrap px-2 py-1.5 font-medium">{h}</th>)}</tr>
+        </thead>
+        <tbody>
+          {shown.length === 0 && <tr><td colSpan={8} className="px-3 py-8 text-center text-muted-foreground"><Activity className="mx-auto mb-2 size-5" />No packets match.</td></tr>}
+          {shown.map((p) => (
+            <tr key={p.id} onClick={() => onSel(p.id)} className={`cursor-pointer border-b border-border/40 ${p.id === selId ? "bg-accent" : p.retrans ? "bg-warning/10" : "hover:bg-muted"}`}>
+              <td className="px-2 py-1 text-muted-foreground">{p.id}</td>
+              <td className="px-2 py-1 whitespace-nowrap">{((p.ts - t0) / 1000).toFixed(3)}</td>
+              <td className="px-2 py-1 whitespace-nowrap">{p.src}{p.srcPort != null && <span className="text-muted-foreground">:{p.srcPort}</span>}</td>
+              <td className="px-2 py-1 whitespace-nowrap">{p.dst}{p.dstPort != null && <span className="text-muted-foreground">:{p.dstPort}</span>}</td>
+              <td className={`px-2 py-1 font-medium ${PROTO_CLS[p.proto]}`}>{p.proto}</td>
+              <td className={`whitespace-nowrap px-2 py-1 ${CAT_CLS[p.appCat ?? "Other"]}`}>{p.app}</td>
+              <td className="px-2 py-1">{p.length}</td>
+              <td className={`max-w-[28rem] truncate px-2 py-1 ${p.retrans ? "text-warning" : ""}`}>{p.info}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > 600 && <p className="p-2 text-center text-xs text-muted-foreground">Showing latest 600 of {rows.length.toLocaleString()} — refine the filter to narrow.</p>}
+    </div>
+  );
+}
+
+function Flows({ rows }: { rows: Packet[] }) {
+  const flows = useMemo(() => {
+    const m = new Map<string, { a: string; b: string; proto: string; pkts: number; bytes: number; first: number; last: number; retrans: number; label?: string }>();
+    for (const p of rows) {
+      if (p.srcPort == null) continue;
+      const x = `${p.src}:${p.srcPort}`, y = `${p.dst}:${p.dstPort}`;
+      const [a, b] = x < y ? [x, y] : [y, x];
+      const l4 = p.tcpFlags !== undefined ? "TCP" : "UDP";
+      const k = `${l4} ${a} ${b}`;
+      let f = m.get(k);
+      if (!f) m.set(k, (f = { a, b, proto: l4, pkts: 0, bytes: 0, first: p.ts, last: p.ts, retrans: 0 }));
+      f.pkts++; f.bytes += p.length; f.last = p.ts; if (p.retrans) f.retrans++;
+      f.label ??= p.tls?.sni ?? p.http?.host ?? p.dns?.name;
+    }
+    return [...m.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 300);
+  }, [rows]);
+  return (
+    <table className="w-full font-mono text-[11px]">
+      <thead className="sticky top-0 bg-card text-left text-muted-foreground"><tr>{["Proto", "Endpoint A", "Endpoint B", "App", "Pkts", "Bytes", "Duration", "Retrans"].map((h) => <th key={h} className="px-2 py-1.5 font-medium">{h}</th>)}</tr></thead>
+      <tbody>{flows.map((f) => (
+        <tr key={`${f.proto}${f.a}${f.b}`} className="border-b border-border/40 hover:bg-muted">
+          <td className="px-2 py-1">{f.proto}</td><td className="px-2 py-1">{f.a}</td><td className="px-2 py-1">{f.b}</td>
+          <td className="px-2 py-1 text-primary">{f.label ?? ""}</td><td className="px-2 py-1">{f.pkts}</td><td className="px-2 py-1">{fmtBytes(f.bytes)}</td>
+          <td className="px-2 py-1">{((f.last - f.first) / 1000).toFixed(2)}s</td><td className={`px-2 py-1 ${f.retrans ? "text-warning" : "text-muted-foreground"}`}>{f.retrans}</td>
+        </tr>))}</tbody>
+    </table>
+  );
+}
+
+function Insight({ rows, cols, cell, onSel }: { rows: Packet[]; cols: string[]; cell: (p: Packet) => string[]; onSel: (id: number) => void }) {
+  return (
+    <table className="w-full font-mono text-[11px]">
+      <thead className="sticky top-0 bg-card text-left text-muted-foreground"><tr><th className="px-2 py-1.5 font-medium">No.</th>{cols.map((c) => <th key={c} className="px-2 py-1.5 font-medium">{c}</th>)}</tr></thead>
+      <tbody>
+        {rows.length === 0 && <tr><td colSpan={cols.length + 1} className="px-3 py-8 text-center text-muted-foreground">Nothing decoded yet.</td></tr>}
+        {rows.slice(-400).reverse().map((p) => (
+          <tr key={p.id} onClick={() => onSel(p.id)} className="cursor-pointer border-b border-border/40 hover:bg-muted">
+            <td className="px-2 py-1 text-muted-foreground">{p.id}</td>
+            {cell(p).map((c, i) => <td key={i} className="max-w-[24rem] truncate px-2 py-1">{c}</td>)}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function ProtoTree({ p, onField, hl }: { p: Packet; onField: (f: Field) => void; hl: [number, number] | null }) {
+  const [closed, setClosed] = useState<Set<number>>(new Set());
+  return (
+    <div className="overflow-auto border-b border-border p-2 font-mono text-[11px] md:border-b-0 md:border-r">
+      {p.layers.map((l, i) => (
+        <div key={i} className="mb-1">
+          <button onClick={() => { const s = new Set(closed); s.has(i) ? s.delete(i) : s.add(i); setClosed(s); l.r && onField({ k: "", v: "", r: l.r }); }} className="w-full text-left font-semibold text-primary hover:underline">
+            {closed.has(i) ? "▸" : "▾"} {l.name}
+          </button>
+          {!closed.has(i) && l.fields.map((f, j) => (
+            <button key={j} onClick={() => onField(f)} className={`block w-full truncate pl-4 text-left hover:bg-muted ${hl && f.r && hl[0] === f.r[0] && hl[1] === f.r[1] ? "bg-accent" : ""}`}>
+              <span className="text-muted-foreground">{f.k}:</span> {f.v}
+            </button>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HexView({ bytes, hl }: { bytes: Uint8Array; hl: [number, number] | null }) {
+  const lines = [];
+  for (let o = 0; o < bytes.length; o += 16) {
+    const row = Array.from(bytes.slice(o, o + 16));
+    const on = (i: number) => hl && o + i >= hl[0] && o + i < hl[1];
+    lines.push(
+      <div key={o} className="flex gap-3 whitespace-pre">
+        <span className="text-muted-foreground">{o.toString(16).padStart(4, "0")}</span>
+        <span>{row.map((b, i) => <span key={i} className={on(i) ? "bg-primary text-primary-foreground" : ""}>{b.toString(16).padStart(2, "0")}{i === 7 ? "  " : " "}</span>)}{"   ".repeat(16 - row.length)}</span>
+        <span className="text-muted-foreground">{row.map((b, i) => <span key={i} className={on(i) ? "bg-primary text-primary-foreground" : ""}>{b >= 32 && b < 127 ? String.fromCharCode(b) : "·"}</span>)}</span>
+      </div>,
+    );
+  }
+  return <div className="overflow-auto p-2 font-mono text-[11px] leading-5">{lines}</div>;
+}
+
+const KIND = (p: Packet) => p.http?.method ? "HTTP request" : p.http ? "HTTP response" : p.tls?.type === "ClientHello" ? "HTTPS open" : p.tls ? "TLS" : p.dns ? (p.dns.response ? "DNS answer" : "DNS lookup") : p.proto === "UDP" && (p.dstPort === 443 || p.srcPort === 443) ? "QUIC (UDP)" : p.proto;
+
+/** Groups traffic into one box per app; clicking a box lists every request that app made. */
+function AppsView({ rows, app, setApp, hostOf, t0, onSel }: { rows: Packet[]; app: string | null; setApp: (a: string | null) => void; hostOf: (ip: string) => string; t0: number; onSel: (id: number) => void }) {
+  const apps = useMemo(() => {
+    const m = new Map<string, { name: string; cat: string; pkts: number; bytes: number; first: number; last: number; devices: Set<string>; domains: Map<string, number>; urls: Set<string>; udp: number }>();
+    for (const p of rows) {
+      if (!p.app) continue;
+      let a = m.get(p.app);
+      if (!a) m.set(p.app, (a = { name: p.app, cat: p.appCat ?? "Other", pkts: 0, bytes: 0, first: p.ts, last: p.ts, devices: new Set(), domains: new Map(), urls: new Set(), udp: 0 }));
+      a.pkts++; a.bytes += p.length; a.last = p.ts;
+      const local = isPrivate(p.src) && p.src !== "192.168.1.1" ? p.src : p.dst;
+      if (isPrivate(local) && local !== "192.168.1.1") a.devices.add(local);
+      if (p.domain && !/^\d/.test(p.domain)) a.domains.set(p.domain, (a.domains.get(p.domain) ?? 0) + 1);
+      if (p.http?.method && p.url) a.urls.add(p.url);
+      if (p.proto === "UDP" || p.proto === "DNS") a.udp++;
+    }
+    return [...m.values()].sort((x, y) => y.bytes - x.bytes);
+  }, [rows]);
+
+  const sel = apps.find((a) => a.name === app);
+  if (!sel) {
+    return (
+      <div className="grid gap-2 p-3 sm:grid-cols-2 xl:grid-cols-3">
+        {apps.length === 0 && <p className="col-span-full py-8 text-center text-sm text-muted-foreground">No app activity yet — press Start.</p>}
+        {apps.map((a) => (
+          <button key={a.name} onClick={() => setApp(a.name)} className="rounded-md border border-border bg-card p-3 text-left transition-colors hover:border-ring/60">
+            <div className="flex items-center gap-2">
+              <Globe className={`size-4 ${CAT_CLS[a.cat]}`} />
+              <span className="truncate text-sm font-medium">{a.name}</span>
+              <span className="ml-auto rounded bg-muted px-1.5 text-[10px] uppercase text-muted-foreground">{a.cat}</span>
+            </div>
+            <div className="mt-1 text-[11px] text-muted-foreground">on {[...a.devices].map(hostOf).join(", ") || "network"}</div>
+            <div className="mt-1.5 flex justify-between font-mono text-[11px]"><span>{fmtBytes(a.bytes)} · {a.pkts} pkts</span><span className="text-muted-foreground">{a.udp} UDP</span></div>
+            <div className="mt-1.5 space-y-0.5 font-mono text-[11px]">
+              {[...a.domains.entries()].sort((x, y) => y[1] - x[1]).slice(0, 3).map(([d]) => <div key={d} className="truncate text-primary">{d}</div>)}
+              {[...a.urls].slice(-2).map((u) => <div key={u} className="truncate text-p-http">{u}</div>)}
+            </div>
+          </button>
+        ))}
+      </div>
+    );
+  }
+  const reqs = rows.filter((p) => p.app === sel.name && (p.http || p.dns || p.tls?.type === "ClientHello" || p.tls?.type === "Certificate" || p.proto === "UDP" || p.proto === "ARP" || p.proto === "ICMP"));
+  return (
+    <div>
+      <div className="flex flex-wrap items-center gap-3 border-b border-border px-3 py-2 text-xs">
+        <button onClick={() => setApp(null)} className="inline-flex items-center gap-1 text-primary"><ChevronLeft className="size-4" /> All apps</button>
+        <span className="font-medium">{sel.name}</span>
+        <span className="text-muted-foreground">{reqs.length} requests · {sel.domains.size} domains · {fmtBytes(sel.bytes)}</span>
+      </div>
+      <table className="w-full font-mono text-[11px]">
+        <thead className="sticky top-0 bg-card text-left text-muted-foreground"><tr>{["Time", "Device", "Type", "Full URL / domain", "What happened", "Len"].map((h) => <th key={h} className="whitespace-nowrap px-2 py-1.5 font-medium">{h}</th>)}</tr></thead>
+        <tbody>
+          {reqs.slice(-500).reverse().map((p) => {
+            const local = isPrivate(p.src) && p.src !== "192.168.1.1" ? p.src : p.dst;
+            return (
+              <tr key={p.id} onClick={() => onSel(p.id)} className="cursor-pointer border-b border-border/40 hover:bg-muted">
+                <td className="whitespace-nowrap px-2 py-1">{((p.ts - t0) / 1000).toFixed(2)}s</td>
+                <td className="whitespace-nowrap px-2 py-1">{hostOf(local)}</td>
+                <td className={`whitespace-nowrap px-2 py-1 ${PROTO_CLS[p.proto]}`}>{KIND(p)}</td>
+                <td className="max-w-[26rem] truncate px-2 py-1 text-primary">{p.url ?? p.domain ?? p.dst}</td>
+                <td className="max-w-[24rem] truncate px-2 py-1 text-muted-foreground">{p.http?.status ? `${p.http.status} ${p.http.contentType ?? ""}` : p.action}</td>
+                <td className="px-2 py-1">{p.length}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="p-2 text-center text-[11px] text-muted-foreground">Full paths are visible only for unencrypted HTTP. For HTTPS and QUIC, the address bar path is encrypted — only the site name is shown.</p>
+    </div>
+  );
+}
+
+function Explain({ p, host }: { p: Packet; host: (ip: string) => string | undefined }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => setOpen(false), [p.id]);
+  const r = open ? explainPacket(p, host) : null;
+  return (
+    <div className="border-t border-border p-2 text-xs md:col-span-2">
+      {!r ? <button onClick={() => setOpen(true)} className="rounded bg-primary px-3 py-1.5 font-medium text-primary-foreground">Analyze this packet</button> : (
+        <div className="space-y-1">
+          <p className="font-medium">{r.summary}</p>
+          {r.points.map((x, i) => <p key={i} className="text-muted-foreground">• {x}</p>)}
+          {r.warnings.map((x, i) => <p key={i} className="text-warning">⚠ {x}</p>)}
+        </div>
+      )}
+    </div>
+  );
+}
